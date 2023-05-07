@@ -1,0 +1,128 @@
+#!/usr/bin/perl
+use strict;
+use warnings;
+use CGI qw(:standard);
+
+use IPC::Run;
+use File::Temp;
+
+package Config;
+# default configurations
+my %config_default = (
+#     arch => {
+#         gcc => 'arch-gcc',
+#         objdump => 'arch-objdump'
+#         byteorder => 'be' # le by default
+#     }
+);
+
+# config file should operate on this variable
+our %config;
+
+sub load($$) {
+    my ($config_file, $config) = @_;
+    %config = %config_default;
+    unless (my $return = do $config_file) {
+        die "couldn't parse config file: $@" if $@;
+        die "couldn't do config file: $!"    unless defined $return;
+        die "couldn't run config file"       unless $return;
+    }
+
+    # copy instead of reference for multiple instances of objects having
+    # different configurations.
+    %$config = %config;
+}
+
+package main;
+
+my $config = {};
+
+sub hwdisassembler {
+    my ($hexstr, $arch) = @_;
+
+    my $config_arch = $config->{$arch};
+    my ($gcc_in, $gcc_out, $gcc_err);
+
+    for my $l (split(/\n/, $hexstr)) {
+        my ($addr, $code1) = ($l =~ m/^([[:xdigit:]]+:)?\s*([[:xdigit:]]+)/g);
+        $addr ||= '';
+        unless (defined $code1) {
+            die "Unrecognized line: $l\n";
+            next;
+        }
+        my $codelen = length($code1);
+        die "codelen should be eval number\n" if ($codelen % 2);
+        my ($codes) = ($l =~ m/^$addr\s*(([[:xdigit:]]{$codelen}\s+)+([[:xdigit:]]{$codelen}$)?)/g);
+        $addr =~ s/:$//g if $addr;
+        $gcc_in .= ". = 0x$addr\n" if $addr;
+        for my $codegroup (split /\s/, $codes) {
+            my (@codebytes) = ($codegroup =~ m/../g);
+            if ($config_arch->{byteorder} eq 'be') {
+                $gcc_in .= ".byte 0x$_\n" for @codebytes;
+            } else {
+                $gcc_in .= ".byte 0x$_\n" for reverse @codebytes;
+            }
+        }
+    }
+
+    my (undef, $tmpobj) = File::Temp::tempfile("hwdisasXXXXXXX", DIR => '/tmp', SUFFIX => '.o', UNLINK => 1);
+    IPC::Run::run [$config_arch->{gcc}, '-c', '-x', 'assembler-with-cpp', '-', '-o', $tmpobj], \$gcc_in, \$gcc_out, \$gcc_err
+          or die "gcc failed\n$gcc_err\n";
+    my ($objdump_in, $objdump_out, $objdump_err);
+    my @Moption;
+    @Moption = ('-M', $config_arch->{objdump_Moption}) if $config_arch->{objdump_Moption};
+    IPC::Run::run [$config_arch->{objdump}, @Moption, '-S', $tmpobj], \$objdump_in, \$objdump_out, \$objdump_err
+          or die "objdump failed\n$objdump_err\n";
+
+    return $objdump_out;
+}
+
+my ($config_file, $mode, $arch) = @ARGV;
+
+die "Configuration file not specified\n" unless defined $config_file;
+die "Mode not specified\n" unless defined $mode;
+
+Config::load($config_file, $config);
+
+if ($mode eq 'pipe') {
+    die "Architecture not specified\n" unless defined $arch;
+    local $/;
+    undef $/;
+    print hwdisassembler(<STDIN>, $arch);
+} elsif ($mode eq 'cgi') {
+    print header(-charset => 'utf-8');
+    print start_html("HW Web disassembler");
+    eval {
+        my $code = param('code') || '';
+        my $arch = param('arch') || '';
+        my $option_arches = '';
+        $option_arches .= '<option '.($_ eq $arch?'selected':'').' value="'.$_.'">'.$_."</option>\n"
+            for keys %$config;
+        print <<QHEAD;
+<form method="POST">
+<b>Architecture</b>
+<select name="arch">
+$option_arches
+</select><br>
+<b>Binary Hex Strings</b><br/>
+<textarea name="code" cols="80" rows="15" wrap="off">$code</textarea><br/>
+<input type="submit" value="Disassemble"><br>
+</form><br/>
+<b>Assembly codes</b><br/>
+QHEAD
+        if ($code) {
+            my $disas;
+            eval {
+                $disas = hwdisassembler($code, $arch);
+            };
+            print "<pre>", $disas, "</pre>";
+            print "<red>$@</red>" if ($@);
+        }
+    };
+    if ($@) {
+        print "<b>Internal failed: $@</b>";
+    }
+    print end_html;
+} else {
+    die "Unknown mode: $mode";
+}
